@@ -1,0 +1,7 @@
+Java:
+
+Total memory usage: 274.98 MB
+
+Python:
+
+Total memory usage: 64.93 MB
