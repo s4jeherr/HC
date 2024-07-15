@@ -2,10 +2,14 @@ import numpy as np
 from scipy.io import wavfile
 from scipy.io.wavfile import write
 from concurrent.futures import ProcessPoolExecutor
-from numba import cuda, jit, float32
 from math import ceil
 import cupy as cp
-from pyculib.fft import FFT
+from skcuda.fft import Plan, fft
+import pycuda.autoinit
+import pycuda.gpuarray as gpuarray
+import pycuda.autoinit
+import skcuda.fft as cu_fft
+import time
 
 
 def sequential(wav_path, block_size, offset, threshold):
@@ -14,8 +18,8 @@ def sequential(wav_path, block_size, offset, threshold):
         raise ValueError("Block size must be between 64 and 512")
 
     # Validate the offset
-    if offset >= block_size:
-        raise ValueError("Offset must be smaller than the block size")
+    if offset >= block_size or offset <= 0:
+        raise ValueError("Offset must be smaller than the block size and greater than 0")
 
     # Read the WAV file
     sample_rate, data = wavfile.read(wav_path)
@@ -145,67 +149,64 @@ def compare_times_cpu(wav_path, block_size, offset, threshold, num_cores):
     print(f"Parallel function time: {parallel_time:.4f} seconds")
     print(f"Speedup: {speedup:.2f}x")
 
-@cuda.jit
-def process_blocks(data, starts, block_size, results):
-    thread_id = cuda.grid(1)
-    if thread_id < len(starts):
-        start = starts[thread_id]
-        for i in range(block_size):
-            results[thread_id, i] = data[start + i]
-
-def parallel_gpu(wav_path, block_size, offset, threshold, num_cores):
-    # Validate the block size and offset
+def parallel_gpu(wav_path, block_size, offset, threshold, num_gpus):
+    # Validate the block size
     if not (64 <= block_size <= 512):
         raise ValueError("Block size must be between 64 and 512")
+
+    # Validate the offset
     if offset >= block_size:
         raise ValueError("Offset must be smaller than the block size")
 
-    # Read the WAV file
-    sample_rate, data = wavfile.read(wav_path)
+    # Read WAV file
+    rate, audio_data = wavfile.read(wav_path)
+    audio_data = audio_data.astype(np.float32)
 
-    # If the data is stereo, convert it to mono by averaging the channels
-    if len(data.shape) == 2:
-        data = np.mean(data, axis=1)
+    # Calculate number of blocks
+    num_blocks = (audio_data.shape[0] - block_size) // offset + 1
 
-    # Define the start points for each block
-    starts = np.arange(0, len(data) - block_size + 1, offset)
+    # Allocate GPU memory for input and output
+    input_gpu = gpuarray.to_gpu(audio_data)
+    output_gpu = gpuarray.empty((num_blocks * num_gpus, block_size // 2 + 1), np.complex64)
 
-    # Allocate GPU memory for results
-    fft_results_real = np.zeros((len(starts), block_size), dtype=np.float32)
-    d_data = cuda.to_device(data.astype(np.float32))
-    d_starts = cuda.to_device(starts)
-    d_results = cuda.device_array((len(starts), block_size), dtype=np.float32)
+    # Initialize FFT plans for each GPU
+    plans = [cu_fft.Plan(block_size, np.float32, np.complex64) for _ in range(num_gpus)]
 
-    # Configure the kernel
-    threads_per_block = num_cores
-    blocks_per_grid = (len(starts) + threads_per_block - 1) // threads_per_block
+    # Perform FFT on GPU using multiple cores
+    for i in range(num_gpus):
+        # Calculate start indices for GPU i
+        start_indices = np.arange(i * offset, audio_data.shape[0] - block_size + 1, num_gpus)
 
-    # Execute the kernel
-    process_blocks[blocks_per_grid, threads_per_block](d_data, d_starts, block_size, d_results)
+        for j, start_idx in enumerate(start_indices):
+            # Ensure that start_idx is within bounds
+            if start_idx + block_size > audio_data.shape[0]:
+                break
 
-    # Copy results back from GPU
-    cuda.synchronize()
-    fft_results_real = d_results.copy_to_host()
+            # Extract input block for GPU i
+            input_block_gpu = input_gpu[start_idx:start_idx + block_size]
 
-    # Perform FFT on the GPU using scikit-cuda
-    fft_results = np.zeros((len(starts), block_size // 2 + 1), dtype=np.complex64)
-    plan = cu_fft.Plan(block_size, np.float32, np.complex64)
+            # Perform FFT on the input block and store in output_gpu
+            output_index = j * num_gpus + i
+            cu_fft.fft(input_block_gpu, output_gpu[output_index, :], plans[i])
 
-    for i in range(len(starts)):
-        d_block = gpuarray.to_gpu(fft_results_real[i])
-        d_fft_result = gpuarray.empty(block_size // 2 + 1, np.complex64)
-        cu_fft.fft(d_block, d_fft_result, plan)
-        fft_results[i] = d_fft_result.get()
+    # Retrieve the result from GPU
+    result = output_gpu.get()
 
-    # Compute the mean amplitude for each frequency
-    mean_amplitudes = np.mean(np.abs(fft_results), axis=0)
+    # Calculate FFT magnitude (without normalization)
+    fft_magnitude = np.abs(result)
 
-    # Find and print the frequencies with mean amplitude above the threshold
-    frequencies = np.fft.rfftfreq(block_size, d=1/sample_rate)
-    for freq, amp in zip(frequencies, mean_amplitudes):
+    # Calculate frequencies
+    frequencies = np.fft.rfftfreq(block_size, d=1.0 / rate)
+
+    # Compute mean amplitudes
+    mean_amplitudes = np.mean(fft_magnitude, axis=0)
+
+    # Output frequencies and amplitudes exceeding threshold
+    for i in range(mean_amplitudes.shape[0]):
+        freq = frequencies[i]
+        amp = mean_amplitudes[i]
         if amp > threshold:
             print(f"Frequency: {freq:.2f} Hz, Mean Amplitude: {amp:.2f}")
-
 
 def compare_times_gpu(wav_path, block_size, offset, threshold, num_gpus):
     # Measure time for the original function
@@ -213,20 +214,21 @@ def compare_times_gpu(wav_path, block_size, offset, threshold, num_gpus):
     sequential(wav_path, block_size, offset, threshold)
     original_time = time.time() - start_time
 
+    print(f"Original function time: {original_time:.4f} seconds")
+
     # Measure time for the parallel function
     start_time = time.time()
-    parallel_gpu(wav_path, block_size, offset, threshold, nump_gpus)
+    parallel_gpu(wav_path, block_size, offset, threshold, num_gpus)
     parallel_time = time.time() - start_time
 
     # Calculate speedup
     speedup = original_time / parallel_time
 
-    print(f"Original function time: {original_time:.4f} seconds")
+
     print(f"Parallel function time: {parallel_time:.4f} seconds")
     print(f"Speedup: {speedup:.2f}x")
 
 
 if __name__ == '__main__':
-    #generate_wav_file('test_signal.wav', frequency=440, amplitude=0.5, duration=600.0)
-    parallel_gpu('nicht_zu_laut_abspielen.wav', block_size=256, offset=10, threshold=4000, num_cores=20)
-    #compare_times('test_signal.wav', block_size=128, offset=10, threshold=4000, num_cores=16)
+    generate_wav_file('test_signal.wav', frequency=440, amplitude=0.5, duration=3000.0)
+    compare_times_cpu('test_signal.wav', block_size=256, offset=10, threshold=100000, num_cores=8)
